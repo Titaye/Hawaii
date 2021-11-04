@@ -47,16 +47,16 @@ type RequestPart =
     static member query(key: string, values: int list) = Query(key, OpenApiValue.List [ for value in values -> OpenApiValue.Int value ])
     static member query(key: string, value: int64) = Query(key, OpenApiValue.Int64 value)
     static member query(key: string, value: string) = Query(key, OpenApiValue.String value)
-    static member query(key: string, value: string option) = 
-        match value with 
+    static member query(key: string, value: string option) =
+        match value with
         | Some text -> Query(key, OpenApiValue.String text)
         | None -> Ignore
-    static member query(key: string, value: int option) = 
-        match value with 
+    static member query(key: string, value: int option) =
+        match value with
         | Some number -> Query(key, OpenApiValue.Int number)
         | None -> Ignore
-    static member query(key: string, value: bool option) = 
-        match value with 
+    static member query(key: string, value: bool option) =
+        match value with
         | Some flag -> Query(key, OpenApiValue.Bool flag)
         | None -> Ignore
     static member query(key: string, value: double option) =
@@ -72,8 +72,8 @@ type RequestPart =
         | Some instance ->
             let format = (^a: (member Format: unit -> string) (instance))
             Query(key, OpenApiValue.String format)
-    static member query(key: string, value: int64 option) = 
-        match value with 
+    static member query(key: string, value: int64 option) =
+        match value with
         | Some number -> Query(key, OpenApiValue.Int64 number)
         | None -> Ignore
 
@@ -316,7 +316,7 @@ module OpenApiHttp =
     let postBinaryAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) =
         sendBinaryAsync httpClient HttpMethod.Post path parts
 
-    let postBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) = 
+    let postBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) =
         postBinaryAsync httpClient path parts
         {convertSync}
 
@@ -361,7 +361,7 @@ module OpenApiHttp =
     let patchBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) =
         patchBinaryAsync httpClient path parts
         {convertSync}
-    
+
     let headAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) =
         sendAsync httpClient (HttpMethod "HEAD") path parts
 
@@ -393,7 +393,7 @@ let library isTask projectName =
         then "response.Content.ReadAsStringAsync()"
         else "Async.AwaitTask(response.Content.ReadAsStringAsync())"
 
-    let getBinaryContent = 
+    let getBinaryContent =
         if isTask
         then "response.Content.ReadAsByteArrayAsync()"
         else "Async.AwaitTask(response.Content.ReadAsByteArrayAsync())"
@@ -410,7 +410,7 @@ let library isTask projectName =
 let fableContent = """namespace {projectName}.Http
 
 open System
-open Fable.SimpleJson
+// open Fable.SimpleJson
 open Fable.SimpleHttp
 open Fable.Core
 open Fable.Core.JsInterop
@@ -557,8 +557,10 @@ type ByteArrayExtensions =
         dataUrl
 
 module Serializer =
-    let inline serialize<'t> (value: 't) = Json.serialize value
-    let inline deserialize<'t> (content: string) = Json.parseNativeAs<'t>(content)
+    let inline serialize<'T> (value: 'T) = Thoth.Json.Encode.Auto.toString(0, value, Thoth.Json.CaseStrategy.CamelCase)
+    let inline deserialize<'T> json = Thoth.Json.Decode.Auto.fromString<'T>(json, Thoth.Json.CaseStrategy.CamelCase)
+    // let inline serialize<'t> (value: 't) = Json.serialize value
+    // let inline deserialize<'t> (content: string) = Json.parseNativeAs<'t>(content)
 
 [<RequireQualifiedAccess>]
 type OpenApiValue =

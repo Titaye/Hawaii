@@ -18,6 +18,7 @@ open Microsoft.OpenApi.OData
 open Microsoft.OData.Edm.Csdl
 open Microsoft.OpenApi.Writers
 open Newtonsoft.Json
+open Microsoft.OpenApi.Any
 
 
 
@@ -45,6 +46,7 @@ type EmptyDefinitionResolution =
 type Target =
     | FSharp
     | Fable
+    | FableThoth
 
 /// <summary>Describes the async return type of the functions of the generated clients</summary>
 [<RequireQualifiedAccess>]
@@ -107,8 +109,8 @@ let readConfig file =
             Error "The 'output' configuration element must be a string"
         elif isNotNull parts.["target"] && parts.["target"].Type <> JTokenType.String then
             Error "The 'target' configuration element must be a string"
-        elif isNotNull parts.["target"] && parts.["target"].ToObject<string>().ToLower().Trim() <> "fable" && parts.["target"].ToObject<string>().ToLower().Trim() <> "fsharp" then
-            Error "The 'target' configuration element can only be 'fable' or 'fsharp'"
+        elif isNotNull parts.["target"] && parts.["target"].ToObject<string>().ToLower().Trim() <> "fable" && parts.["target"].ToObject<string>().ToLower().Trim() <> "fsharp" && parts.["target"].ToObject<string>().ToLower().Trim() <> "fable-thoth" then
+            Error "The 'target' configuration element can only be 'fable' or 'fsharp' or 'fable-thoth'"
         elif isNotNull parts.["project"] && parts.["project"].Type <> JTokenType.String then
             Error "The 'project' configuration element must be a string"
         elif isNotNull parts.["project"] && String.IsNullOrWhiteSpace(parts.["project"].ToString().Trim()) then
@@ -130,8 +132,13 @@ let readConfig file =
                 output = resolveRelativeFile configParent (parts.["output"].ToObject<string>())
                 project = parts.["project"].ToString().Replace("(", "").Replace(")", "")
                 target =
-                    if isNotNull parts.["target"] && parts.["target"].ToString() = "fable"
-                    then Target.Fable
+                    if isNotNull parts.["target"]
+                    then
+                        if parts.["target"].ToString() = "fable" then
+                            Target.Fable
+                        elif parts.["target"].ToString() = "fable-thoth" then
+                            Target.FableThoth
+                        else Target.FSharp
                     else Target.FSharp
                 asyncReturnType =
                     if isNotNull parts.["asyncReturnType"] && parts.["asyncReturnType"].ToString() = "task"
@@ -153,11 +160,11 @@ let readConfig file =
                     if isNotNull parts.["overrideSchema"]
                     then Some parts.["overrideSchema"]
                     else None
-                filterTags = 
+                filterTags =
                     if isNotNull parts.["filterTags"] && parts.["filterTags"].Type = JTokenType.Array
-                    then [ 
-                            for tag in unbox<JArray> parts.["filterTags"] do 
-                            if tag.Type = JTokenType.String then 
+                    then [
+                            for tag in unbox<JArray> parts.["filterTags"] do
+                            if tag.Type = JTokenType.String then
                                 tag.ToObject<string>() ]
                     else [ ]
                 odataSchema = false
@@ -220,7 +227,7 @@ let simplifyRedundantSchemaParts (schema: JObject) =
     let rec iterate (part: JObject) =
         let properties = List.ofSeq(part.Properties())
         for property in properties do
-            if property.Name.StartsWith "application/vnd" && property.Name.EndsWith "+json" && property.Value.Type = JTokenType.Object && not (part.ContainsKey "application/json") then 
+            if property.Name.StartsWith "application/vnd" && property.Name.EndsWith "+json" && property.Value.Type = JTokenType.Object && not (part.ContainsKey "application/json") then
                 // rewrite JSON-like media types into application/json
                 let mediaType = unbox<JObject> property.Value
                 part.Add("application/json", mediaType)
@@ -234,7 +241,7 @@ let simplifyRedundantSchemaParts (schema: JObject) =
                 let anyOfArray = unbox<JArray> property.Value
                 if anyOfArray.Count = 1 && anyOfArray.[0].Type = JTokenType.Object then
                     let innerObject = unbox<JObject> anyOfArray.[0]
-                    for innerProp in innerObject.Properties() do 
+                    for innerProp in innerObject.Properties() do
                         part.Add(innerProp)
                     part.Remove("anyOf") |> ignore
             elif property.Name = "oneOf" && property.Value.Type = JTokenType.Array then
@@ -245,10 +252,10 @@ let simplifyRedundantSchemaParts (schema: JObject) =
                 let oneOfArray = unbox<JArray> property.Value
                 if oneOfArray.Count = 1 && oneOfArray.[0].Type = JTokenType.Object then
                     let innerObject = unbox<JObject> oneOfArray.[0]
-                    for innerProp in innerObject.Properties() do 
+                    for innerProp in innerObject.Properties() do
                         part.Add(innerProp)
                     part.Remove("oneOf") |> ignore
-            elif property.Name = "allOf" && property.Value.Type = JTokenType.Array then 
+            elif property.Name = "allOf" && property.Value.Type = JTokenType.Array then
                 // simplify this shape
                 // { allOf: [ first, { "example": ... } ] }
                 // into
@@ -257,15 +264,15 @@ let simplifyRedundantSchemaParts (schema: JObject) =
                 if allOfArray.Count = 2 && allOfArray.[0].Type = JTokenType.Object && allOfArray.[1].Type = JTokenType.Object then
                     let firstObject = unbox<JObject> allOfArray.[0]
                     let secondObject = unbox<JObject> allOfArray.[1]
-                    if secondObject.Count = 1 && secondObject.ContainsKey "example" then 
-                        for innerProp in firstObject.Properties() do 
+                    if secondObject.Count = 1 && secondObject.ContainsKey "example" then
+                        for innerProp in firstObject.Properties() do
                             part.Add(innerProp)
                         part.Remove("allOf") |> ignore
-                    else 
+                    else
                         for element in allOfArray do
                             if element.Type = JTokenType.Object then
                                 iterate (unbox<JObject> element)
-                else 
+                else
                     for element in allOfArray do
                         if element.Type = JTokenType.Object then
                             iterate (unbox<JObject> element)
@@ -281,12 +288,12 @@ let simplifyRedundantSchemaParts (schema: JObject) =
     schema
 
 let readExternalODataSchema (schemaUrl: string) =
-    let content = 
+    let content =
         schemaUrl
         |> client.GetStringAsync
         |> Async.AwaitTask
         |> Async.RunSynchronously
-    
+
     let odataModel = CsdlReader.Parse(XElement.Parse(content).CreateReader())
     let openApiModel = odataModel.ConvertToOpenApi();
     use stringTextWriter = new StringWriter()
@@ -308,11 +315,11 @@ let getSchema(schema: string) (overrideSchema: JToken option) =
         if File.Exists schema && schema.EndsWith ".json" then
             let content = File.ReadAllText schema
             JObject.Parse(content)
-        elif File.Exists schema && schema.EndsWith ".xml" then 
+        elif File.Exists schema && schema.EndsWith ".xml" then
             Console.WriteLine "Detected local OData schema"
             let openApiJson = readLocalODataSchema schema
             JObject.Parse openApiJson
-        elif schema.StartsWith "http" && schema.EndsWith "$metadata" then 
+        elif schema.StartsWith "http" && schema.EndsWith "$metadata" then
             Console.WriteLine "Detected external OData schema"
             let openApiJson = readExternalODataSchema schema
             JObject.Parse openApiJson
@@ -348,11 +355,11 @@ let getSchema(schema: string) (overrideSchema: JToken option) =
 
     let simplified = simplifyRedundantSchemaParts schemaContents
     let simplifiedContents = simplified.ToString()
-    if simplifiedContents.Contains "#/components/schemas/odata.error" then 
+    if simplifiedContents.Contains "#/components/schemas/odata.error" then
         simplified.Add(JProperty("x-odata", true))
         let schemaBytes = System.Text.Encoding.UTF8.GetBytes(simplified.ToString())
         new MemoryStream(schemaBytes) :> Stream
-    else 
+    else
         let schemaBytes = System.Text.Encoding.UTF8.GetBytes simplifiedContents
         new MemoryStream(schemaBytes) :> Stream
 
@@ -632,6 +639,7 @@ let invalidTitle (title: string) =
     || (title.Split(' ').Length >= 1)
 
 let rec createFieldType recordName required (propertyName: string) (propertySchema: OpenApiSchema) (config: CodegenConfig) =
+    let propertyName = (propertyName.[0] |> System.Char.ToUpperInvariant |> string) + propertyName.Substring(1)
     if not required then
         let optionalType : SynType = createFieldType recordName true propertyName propertySchema config
         SynType.Option(optionalType)
@@ -971,6 +979,17 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
             then Some (SynType.Map(SynType.String(), fieldType))
             else Some (SynType.Option(SynType.Map(SynType.String(), fieldType)))
         elif isPrimitve then
+            if not (isNull propertyType.Reference) then
+                let typeName =
+                    if invalidTitle propertyType.Title
+                    then sanitizeTypeName propertyType.Reference.Id
+                    else sanitizeTypeName propertyType.Title
+
+                if not (visitedTypes.Contains typeName) then
+                    visitedTypes.Add typeName
+                    let nestedObject = createRecordFromSchema typeName propertyType visitedTypes config openApiDocument factory
+                    nestedObjects.AddRange nestedObject
+
             let fieldType = createFieldType recordName required propertyName propertyType config
             Some fieldType
         else if isEnum && isNull propertyType.Reference then
@@ -1111,6 +1130,10 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                     then sanitizeTypeName arrayItemsType.Reference.Id
                     else sanitizeTypeName arrayItemsType.Title
 
+                if not (visitedTypes.Contains typeName) then
+                    let nestedObject = createRecordFromSchema typeName propertyType visitedTypes config openApiDocument factory
+                    nestedObjects.AddRange nestedObject
+
                 let fieldType =
                     if required
                     then SynType.List(SynType.Create typeName)
@@ -1180,7 +1203,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
             let propertyName = property.Key
             let propertyType = property.Value
             let required = schema.Required.Contains propertyName
-            let field = SynFieldRcd.Create(propertyName, fieldType)
+            let field = SynFieldRcd.Create(capitalize propertyName, fieldType)
             let docs = xmlDocs propertyType.Description
             if not (alreadyContainsProperty propertyName) then
                 recordFields.Add { field with XmlDoc = docs }
@@ -1208,7 +1231,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
             let valueType =
                 if isFreeForm && config.target = Target.FSharp
                 then SynType.JToken()
-                elif isFreeForm && config.target = Target.Fable
+                elif isFreeForm && (config.target = Target.Fable || config.target = Target.FableThoth)
                 then SynType.Object()
                 else additionalType
             let dictionaryType = SynType.Map(SynType.String(), valueType)
@@ -1223,7 +1246,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
         [ createTypeAbbreviation recordName dictionaryType ]
     else
         let odataTypeNameField = "ODataTypeName"
-        if config.odataSchema && config.target = Target.FSharp && not (String.IsNullOrWhiteSpace schema.Title) then 
+        if config.odataSchema && config.target = Target.FSharp && not (String.IsNullOrWhiteSpace schema.Title) then
             let required = false
             let fieldType = SynType.Option(SynType.String())
             let recordField = SynFieldRcd.Create(odataTypeNameField, fieldType)
@@ -1233,12 +1256,12 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
             ]
             recordFields.Insert(0, { recordField with Attributes = [ attributes ] })
             addedFields.Insert(0, (odataTypeNameField, required, fieldType))
-        elif config.odataSchema && not (String.IsNullOrWhiteSpace schema.Title) then 
+        elif config.odataSchema && not (String.IsNullOrWhiteSpace schema.Title) then
             // fable
             let propertyName = "@odata.type"
             let required = false
             let fieldType = SynType.Option(SynType.String())
-           
+
             recordFields.Insert(0, SynFieldRcd.Create(propertyName, fieldType))
             addedFields.Insert(0, (propertyName, required, fieldType))
 
@@ -1246,52 +1269,52 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
         let simpleRecordType = SynTypeDefnSimpleReprRcd.Record recordRepr
 
         let members : SynMemberDefn list = [
-            SynMemberDefn.CreateStaticMember
-                {
-                    SynBindingRcd.Null with
-                        XmlDoc = PreXmlDoc.Create $"Creates an instance of {recordName} with all optional fields initialized to None. The required fields are parameters of this function"
-                        Pattern =
-                            SynPatRcd.Typed {
-                                Type = SynType.Create recordName
-                                Range = range0
-                                Pattern =
-                                    SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString "Create", [
-                                        SynPatRcd.CreateParen(
-                                            SynPatRcd.Tuple {
-                                                Patterns = [
-                                                    for (fieldName, required, fieldType) in addedFields do
-                                                        if fieldName = "additionalProperties" && not containsPreservedProperty then
-                                                            ()
-                                                        elif fieldName = "@odata.type" || (fieldName = "ODataTypeName" && config.odataSchema) then 
-                                                            ()
-                                                        else
-                                                            if required then yield SynPatRcd.Typed {
-                                                                Type = fieldType
-                                                                Pattern = SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString (camelCase fieldName), [])
-                                                                Range = range0
-                                                            }
-                                                ]
-                                                Range  = range0
-                                            }
-                                        )
-                                    ])
-                            }
+            // SynMemberDefn.CreateStaticMember
+            //     {
+            //         SynBindingRcd.Null with
+            //             XmlDoc = PreXmlDoc.Create $"Creates an instance of {recordName} with all optional fields initialized to None. The required fields are parameters of this function"
+            //             Pattern =
+            //                 SynPatRcd.Typed {
+            //                     Type = SynType.Create recordName
+            //                     Range = range0
+            //                     Pattern =
+            //                         SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString "Create", [
+            //                             SynPatRcd.CreateParen(
+            //                                 SynPatRcd.Tuple {
+            //                                     Patterns = [
+            //                                         for (fieldName, required, fieldType) in addedFields do
+            //                                             if fieldName = "additionalProperties" && not containsPreservedProperty then
+            //                                                 ()
+            //                                             elif fieldName = "@odata.type" || (fieldName = "ODataTypeName" && config.odataSchema) then
+            //                                                 ()
+            //                                             else
+            //                                                 if required then yield SynPatRcd.Typed {
+            //                                                     Type = fieldType
+            //                                                     Pattern = SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString (camelCase fieldName), [])
+            //                                                     Range = range0
+            //                                                 }
+            //                                     ]
+            //                                     Range  = range0
+            //                                 }
+            //                             )
+            //                         ])
+            //                 }
 
-                        // create a record with the required fields
-                        Expr = SynExpr.CreateRecord [
-                            for (fieldName, required, fieldType) in addedFields do
-                                let expr =
-                                    if fieldName = "additionalProperties" && not containsPreservedProperty
-                                    then Some(SynExpr.CreateLongIdent(LongIdentWithDots.CreateString "Map.empty"))
-                                    elif fieldName = "@odata.type" || (fieldName = "ODataTypeName" && config.odataSchema)
-                                    then Some(SynExpr.CreatePartialApp([ "Some" ], [ SynExpr.CreateConstString $"#{schema.Title}" ]))
-                                    elif required
-                                    then Some(SynExpr.Ident(Ident.Create (camelCase fieldName)))
-                                    else Some(SynExpr.Ident(Ident.Create "None"))
-                                ((LongIdentWithDots.CreateFromLongIdent([ Ident.Create fieldName ]), false), expr)
-                        ]
-                }
-        ]
+            //             // create a record with the required fields
+            //             Expr = SynExpr.CreateRecord [
+            //                 for (fieldName, required, fieldType) in addedFields do
+            //                     let expr =
+            //                         if fieldName = "additionalProperties" && not containsPreservedProperty
+            //                         then Some(SynExpr.CreateLongIdent(LongIdentWithDots.CreateString "Map.empty"))
+            //                         elif fieldName = "@odata.type" || (fieldName = "ODataTypeName" && config.odataSchema)
+            //                         then Some(SynExpr.CreatePartialApp([ "Some" ], [ SynExpr.CreateConstString $"#{schema.Title}" ]))
+            //                         elif required
+            //                         then Some(SynExpr.Ident(Ident.Create (camelCase fieldName)))
+            //                         else Some(SynExpr.Ident(Ident.Create "None"))
+            //                     ((LongIdentWithDots.CreateFromLongIdent([ Ident.Create fieldName ]), false), expr)
+            //             ]
+            //     }
+            ]
 
         let anyFieldHasDots =
             addedFields
@@ -1314,18 +1337,29 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
 /// Rewrites application/vnd.api+json into application/json to simplify the rest of the codegen pipeline
 /// </summary>
 /// <param name="operation">The operation to rewrite</param>
-let rewriteOperationVendorJson  (operation: OpenApiOperation) = 
-    for response in operation.Responses do 
-        if response.Value.Content.ContainsKey "application/vnd.api+json" && not (response.Value.Content.ContainsKey "application/json") then 
+let rewriteOperationVendorJson  (operation: OpenApiOperation) =
+    for response in operation.Responses do
+        if response.Value.Content.ContainsKey "application/vnd.api+json" && not (response.Value.Content.ContainsKey "application/json") then
             let mediaType = response.Value.Content.["application/vnd.api+json"]
             response.Value.Content.Remove "application/vnd.api+json" |> ignore
             response.Value.Content.Add("application/json", mediaType)
 
-    if isNotNull operation.RequestBody && isNotNull operation.RequestBody.Content then 
-        if operation.RequestBody.Content.ContainsKey "application/vnd.api+json" && not (operation.RequestBody.Content.ContainsKey "application/json") then 
+    if isNotNull operation.RequestBody && isNotNull operation.RequestBody.Content then
+        if operation.RequestBody.Content.ContainsKey "application/vnd.api+json" && not (operation.RequestBody.Content.ContainsKey "application/json") then
             let mediaType = operation.RequestBody.Content.["application/vnd.api+json"]
             operation.RequestBody.Content.Remove "application/vnd.api+json" |> ignore
             operation.RequestBody.Content.Add("application/json", mediaType)
+
+let createResultPayload validType =
+    SynType.App(
+        typeName=SynType.CreateLongIdent "Result",
+        typeArgs=[ validType; SynType.CreateLongIdent "string" ],
+        commaRanges = [ ],
+        isPostfix = false,
+        range=range0,
+        greaterRange=None,
+        lessRange=None
+    )
 
 let createResponseType (operation: OpenApiOperation) (path: string) (operationType: OperationType) (visitedTypes: ResizeArray<string>) (config: CodegenConfig) (document: OpenApiDocument) =
     // rewrite application/vnd.api+json into application/json
@@ -1337,42 +1371,42 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
     operation.Extensions.Add("ResponseTypeName", new Microsoft.OpenApi.Any.OpenApiString(operationName))
     let rec getFieldType (schema: OpenApiSchema) (status: string) (wrapODataResponse: bool) =
         match schema.Type with
-        | "integer" when schema.Format = "int64" -> 
-            if config.odataSchema && wrapODataResponse 
+        | "integer" when schema.Format = "int64" ->
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Int64())
             else SynType.Int64()
-        | "integer" -> 
-            if config.odataSchema && wrapODataResponse 
+        | "integer" ->
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Int())
             else SynType.Int()
-        | "number" when schema.Format = "float" -> 
-            if config.odataSchema && wrapODataResponse 
+        | "number" when schema.Format = "float" ->
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Float32())
             else SynType.Float32()
         | "number" ->
-            if config.odataSchema && wrapODataResponse 
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Double())
             else SynType.Double()
-        | "boolean" -> 
-            if config.odataSchema && wrapODataResponse 
+        | "boolean" ->
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Bool())
             else SynType.Bool()
-            
-        | "string" when schema.Format = "uuid" -> 
-            if config.odataSchema && wrapODataResponse 
+
+        | "string" when schema.Format = "uuid" ->
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Guid())
             else SynType.Guid()
         | "string" when schema.Format = "guid" ->
-            if config.odataSchema && wrapODataResponse 
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Guid())
             else SynType.Guid()
-        | "string" when schema.Format = "date-time" -> 
-            if config.odataSchema && wrapODataResponse 
+        | "string" when schema.Format = "date-time" ->
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.DateTimeOffset())
             else SynType.DateTimeOffset()
         | "string" when schema.Format = "byte" ->
             // base64 encoded characters
-            if config.odataSchema && wrapODataResponse 
+            if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.ByteArray())
             else SynType.ByteArray()
         | "file" ->
@@ -1400,6 +1434,13 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
                 if invalidTitle schema.Title
                 then sanitizeTypeName schema.Reference.Id
                 else sanitizeTypeName schema.Title
+            if not (visitedTypes.Contains typeName) then
+                // createRecordFromSchema nestedObjectTypeName propertyType visitedTypes config openApiDocument factory
+                visitedTypes.Add typeName
+                let factory = FactoryFunction.None
+                for generatedType in createRecordFromSchema typeName schema visitedTypes config document factory do
+                    intermediateTypes.Add generatedType
+
             SynType.Create typeName
         | _ when schema.AdditionalPropertiesAllowed && not (isNull schema.AdditionalProperties) ->
             let valueType = getFieldType schema.AdditionalProperties status false
@@ -1488,20 +1529,27 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
                     if response.Value.Content.ContainsKey "application/json" then
                         let responsePayloadType = response.Value.Content.["application/json"]
                         if not (isNull responsePayloadType.Schema) && not (isEmptySchema responsePayloadType.Schema) then
-                            let fieldType = getFieldType responsePayloadType.Schema caseName true
-                            [SynFieldRcd.Create("payload", fieldType).FromRcd]
+                            let fieldType =
+                                getFieldType responsePayloadType.Schema caseName true
+                                |> createResultPayload
+
+                            [SynFieldRcd.Create("payload", fieldType).FromRcd; SynFieldRcd.Create("status", SynType.Int()).FromRcd]
                         elif isNotNull responsePayloadType.Schema && isEmptySchema responsePayloadType.Schema then
                             if responsePayloadType.Schema.AdditionalPropertiesAllowed && isNotNull responsePayloadType.Schema.AdditionalProperties then
                                 let valueType = getFieldType responsePayloadType.Schema.AdditionalProperties caseName true
                                 let keyType = SynType.String()
-                                let fieldType =  SynType.Map(keyType, valueType)
-                                [SynFieldRcd.Create("payload", fieldType).FromRcd]
-                            elif isNotNull responsePayloadType.Schema.Reference then 
+                                let fieldType =
+                                    SynType.Map(keyType, valueType)
+                                    |> createResultPayload
+                                [SynFieldRcd.Create("payload", fieldType).FromRcd; SynFieldRcd.Create("status", SynType.Int()).FromRcd]
+                            elif isNotNull responsePayloadType.Schema.Reference then
                                 // reference to an empty schema
-                                if config.emptyDefinitions = EmptyDefinitionResolution.GenerateFreeForm then 
-                                    let fieldType = getFieldType responsePayloadType.Schema caseName true
-                                    [SynFieldRcd.Create("payload", fieldType).FromRcd]
-                                else 
+                                if config.emptyDefinitions = EmptyDefinitionResolution.GenerateFreeForm then
+                                    let fieldType =
+                                        getFieldType responsePayloadType.Schema caseName true
+                                        |> createResultPayload
+                                    [SynFieldRcd.Create("payload", fieldType).FromRcd; SynFieldRcd.Create("status", SynType.Int()).FromRcd]
+                                else
                                     []
                             else
                                 []
@@ -1514,7 +1562,9 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
                             [SynFieldRcd.Create("payload", fieldType).FromRcd]
                         else
                             []
-                    elif response.Value.Content.ContainsKey "text/plain" && isNotNull response.Value.Content.["text/plain"].Schema then
+                    elif response.Value.Content.ContainsKey "text/plain"
+                        //&& isNotNull response.Value.Content.["text/plain"].Schema
+                        then
                         let fieldType = SynType.String()
                         [SynFieldRcd.Create("text", fieldType).FromRcd]
                     elif response.Value.Content.ContainsKey "application/octet-stream" || response.Value.Content.ContainsKey "application/pdf" || response.Value.Content.ContainsKey "application/zip" then
@@ -1523,19 +1573,23 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
                     elif response.Value.Content.ContainsKey "image/png" && isNotNull response.Value.Content.["image/png"].Schema && response.Value.Content.["image/png"].Schema.Format = "binary" then
                         let fieldType = SynType.ByteArray()
                         [SynFieldRcd.Create("payload", fieldType).FromRcd]
-                    elif response.Value.Content.ContainsKey "image/png" then 
+                    elif response.Value.Content.ContainsKey "image/png" then
                         let fieldType = SynType.ByteArray()
                         [SynFieldRcd.Create("payload", fieldType).FromRcd]
                     else
                         []
                 let docs = xmlDocs response.Value.Description
-                yield SynUnionCase.UnionCase([], Ident.Create (capitalize caseName), SynUnionCaseType.UnionCaseFields fieldTypes, docs, None, range0)
+                if caseName = "DefaultResponse" then
+                    yield SynUnionCase.UnionCase([], Ident.Create (capitalize caseName), SynUnionCaseType.UnionCaseFields [ yield! fieldTypes ; SynFieldRcd.Create("status", SynType.Int()).FromRcd ], docs, None, range0)
+                else
+                    yield SynUnionCase.UnionCase([], Ident.Create (capitalize caseName), SynUnionCaseType.UnionCaseFields fieldTypes, docs, None, range0)
             | None ->
                 ()
 
         if not containsOkOrDefault then
             let docs = PreXmlDoc.Empty
-            yield SynUnionCase.UnionCase([], Ident.Create (capitalize "DefaultResponse"), SynUnionCaseType.UnionCaseFields [], docs, None, range0)
+            yield SynUnionCase.UnionCase([], Ident.Create (capitalize "DefaultResponse"), SynUnionCaseType.UnionCaseFields [ SynFieldRcd.Create("status", SynType.Int()).FromRcd ], docs, None, range0)
+
     ])
 
 
@@ -1640,14 +1694,14 @@ let rec collectPrimitiveAllOf (schema: OpenApiSchema) =
 
         ]
 
-let includeOperation (operation: OpenApiOperation) (config: CodegenConfig) : bool = 
-    if config.filterTags.IsEmpty then 
+let includeOperation (operation: OpenApiOperation) (config: CodegenConfig) : bool =
+    if config.filterTags.IsEmpty then
         true
-    elif operation.Tags.Count = 0 && config.filterTags.Length > 0 then 
+    elif operation.Tags.Count = 0 && config.filterTags.Length > 0 then
         false
     else
         operation.Tags
-        |> Seq.exists (fun tag -> 
+        |> Seq.exists (fun tag ->
             config.filterTags
             |> List.exists (fun configTag -> tag.Name.StartsWith configTag)
         )
@@ -1656,226 +1710,226 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
     let visitedTypes = ResizeArray<string>()
     let moduleTypes = ResizeArray<SynModuleDecl>()
 
-    if config.odataSchema then 
-        if config.target = Target.Fable then 
-            // Fable target will output @odata.type 
+    if config.odataSchema then
+        if config.target = Target.Fable || config.target = Target.FableThoth  then
+            // Fable target will output @odata.type
             moduleTypes.Add (SynModuleDecl.CreateHashDirective("nowarn", [ "1104" ]))
         moduleTypes.Add (createODataResponse config)
         visitedTypes.Add "ODataResponse"
 
-    if isNotNull openApiDocument.Components then
+    // if isNotNull openApiDocument.Components then
 
-        // first add all global enum types
-        for topLevelObject in openApiDocument.Components.Schemas do
-            let typeName =
-                if invalidTitle topLevelObject.Value.Title
-                then sanitizeTypeName topLevelObject.Key
-                else sanitizeTypeName topLevelObject.Value.Title
+    //     // first add all global enum types
+    //     for topLevelObject in openApiDocument.Components.Schemas do
+    //         let typeName =
+    //             if invalidTitle topLevelObject.Value.Title
+    //             then sanitizeTypeName topLevelObject.Key
+    //             else sanitizeTypeName topLevelObject.Value.Title
 
-            if topLevelObject.Value.Type = "string" then
-                match topLevelObject.Value with
-                | StringEnum cases ->
-                    // create global enum type
-                    moduleTypes.Add (createEnumType typeName cases (Some topLevelObject.Value.Description))
-                    visitedTypes.Add typeName
-                | _ ->
-                    // create abbreviated type
-                    let abbreviatedType =
-                        match topLevelObject.Value.Format with
-                        | "guid" | "uuid" -> SynType.Guid()
-                        | "date-time" -> SynType.DateTimeOffset()
-                        | "byte" -> SynType.ByteArray()
-                        | _ -> SynType.String()
+    //         if topLevelObject.Value.Type = "string" then
+    //             match topLevelObject.Value with
+    //             | StringEnum cases ->
+    //                 // create global enum type
+    //                 moduleTypes.Add (createEnumType typeName cases (Some topLevelObject.Value.Description))
+    //                 visitedTypes.Add typeName
+    //             | _ ->
+    //                 // create abbreviated type
+    //                 let abbreviatedType =
+    //                     match topLevelObject.Value.Format with
+    //                     | "guid" | "uuid" -> SynType.Guid()
+    //                     | "date-time" -> SynType.DateTimeOffset()
+    //                     | "byte" -> SynType.ByteArray()
+    //                     | _ -> SynType.String()
 
-                    moduleTypes.Add (createTypeAbbreviationWithDocs typeName abbreviatedType topLevelObject.Value.Description)
-                    visitedTypes.Add typeName
-            elif topLevelObject.Value.Type = "integer" then
-                match topLevelObject.Value with
-                | IntEnum typeName cases ->
-                    // create global enum type
-                    moduleTypes.Add(createFlagsEnum typeName cases)
-                    visitedTypes.Add typeName
-                | _ ->
-                    // create type abbreviation
-                    let abbreviatedType =
-                        match topLevelObject.Value.Format with
-                        | "int64" -> SynType.Int64()
-                        | _ -> SynType.Int()
-                    moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
-                    visitedTypes.Add typeName
-            elif topLevelObject.Value.Type = "number" then
-                // create type abbreviation
-                let abbreviatedType =
-                    match topLevelObject.Value.Format with
-                    | "float" -> SynType.Float32()
-                    | _ -> SynType.Double()
-                moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
-                visitedTypes.Add typeName
-            elif topLevelObject.Value.Type = "boolean" then
-                // create type abbreviation
-                moduleTypes.Add (createTypeAbbreviation typeName (SynType.Bool()))
-                visitedTypes.Add typeName
-            elif isPrimitiveAllOf topLevelObject.Value then
-                let collectedTypes = collectPrimitiveAllOf topLevelObject.Value
-                let primitiveType =
-                    collectedTypes
-                    |> List.groupBy id
-                    |> List.sortByDescending (fun (key, types) -> List.length types)
-                    |> List.tryHead
-                    |> Option.map (fun (key, types) -> key)
+    //                 moduleTypes.Add (createTypeAbbreviationWithDocs typeName abbreviatedType topLevelObject.Value.Description)
+    //                 visitedTypes.Add typeName
+    //         elif topLevelObject.Value.Type = "integer" then
+    //             match topLevelObject.Value with
+    //             | IntEnum typeName cases ->
+    //                 // create global enum type
+    //                 moduleTypes.Add(createFlagsEnum typeName cases)
+    //                 visitedTypes.Add typeName
+    //             | _ ->
+    //                 // create type abbreviation
+    //                 let abbreviatedType =
+    //                     match topLevelObject.Value.Format with
+    //                     | "int64" -> SynType.Int64()
+    //                     | _ -> SynType.Int()
+    //                 moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
+    //                 visitedTypes.Add typeName
+    //         elif topLevelObject.Value.Type = "number" then
+    //             // create type abbreviation
+    //             let abbreviatedType =
+    //                 match topLevelObject.Value.Format with
+    //                 | "float" -> SynType.Float32()
+    //                 | _ -> SynType.Double()
+    //             moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
+    //             visitedTypes.Add typeName
+    //         elif topLevelObject.Value.Type = "boolean" then
+    //             // create type abbreviation
+    //             moduleTypes.Add (createTypeAbbreviation typeName (SynType.Bool()))
+    //             visitedTypes.Add typeName
+    //         elif isPrimitiveAllOf topLevelObject.Value then
+    //             let collectedTypes = collectPrimitiveAllOf topLevelObject.Value
+    //             let primitiveType =
+    //                 collectedTypes
+    //                 |> List.groupBy id
+    //                 |> List.sortByDescending (fun (key, types) -> List.length types)
+    //                 |> List.tryHead
+    //                 |> Option.map (fun (key, types) -> key)
 
-                match primitiveType with
-                | Some "string" ->
-                    moduleTypes.Add (createTypeAbbreviation typeName (SynType.String()))
-                    visitedTypes.Add typeName
-                | Some "boolean" ->
-                    moduleTypes.Add (createTypeAbbreviation typeName (SynType.Bool()))
-                    visitedTypes.Add typeName
-                | Some "integer" ->
-                    moduleTypes.Add (createTypeAbbreviation typeName (SynType.Int()))
-                    visitedTypes.Add typeName
-                | Some "number" ->
-                    moduleTypes.Add (createTypeAbbreviation typeName (SynType.Double()))
-                    visitedTypes.Add typeName
-                | _ ->
-                    ()
-            elif topLevelObject.Value.Type = "array" then
-                let elementType = topLevelObject.Value.Items
-                if isNull elementType then 
-                    if config.target = Target.FSharp then
-                        moduleTypes.Add (createTypeAbbreviation typeName (SynType.JArray()))
-                        visitedTypes.Add typeName
-                    else
-                        moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Object())))
-                        visitedTypes.Add typeName
-                elif isNotNull elementType.Reference && isNotNull elementType.Reference.Id then
-                    let referencedType = elementType.Reference.Id
-                    moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Create referencedType)))
-                    visitedTypes.Add typeName
-                elif elementType.Type = "string" then
-                    match elementType with
-                    | StringEnum cases ->
-                        // create global enum type
-                        let enumTypeName = $"EnumFor{typeName}";
-                        moduleTypes.Add (createEnumType enumTypeName cases None)
-                        let arrayOfEnum = SynType.List(SynType.Create enumTypeName)
-                        moduleTypes.Add (createTypeAbbreviation typeName arrayOfEnum)
+    //             match primitiveType with
+    //             | Some "string" ->
+    //                 moduleTypes.Add (createTypeAbbreviation typeName (SynType.String()))
+    //                 visitedTypes.Add typeName
+    //             | Some "boolean" ->
+    //                 moduleTypes.Add (createTypeAbbreviation typeName (SynType.Bool()))
+    //                 visitedTypes.Add typeName
+    //             | Some "integer" ->
+    //                 moduleTypes.Add (createTypeAbbreviation typeName (SynType.Int()))
+    //                 visitedTypes.Add typeName
+    //             | Some "number" ->
+    //                 moduleTypes.Add (createTypeAbbreviation typeName (SynType.Double()))
+    //                 visitedTypes.Add typeName
+    //             | _ ->
+    //                 ()
+    //         elif topLevelObject.Value.Type = "array" then
+    //             let elementType = topLevelObject.Value.Items
+    //             if isNull elementType then
+    //                 if config.target = Target.FSharp then
+    //                     moduleTypes.Add (createTypeAbbreviation typeName (SynType.JArray()))
+    //                     visitedTypes.Add typeName
+    //                 else
+    //                     moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Object())))
+    //                     visitedTypes.Add typeName
+    //             elif isNotNull elementType.Reference && isNotNull elementType.Reference.Id then
+    //                 let referencedType = elementType.Reference.Id
+    //                 moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Create referencedType)))
+    //                 visitedTypes.Add typeName
+    //             elif elementType.Type = "string" then
+    //                 match elementType with
+    //                 | StringEnum cases ->
+    //                     // create global enum type
+    //                     let enumTypeName = $"EnumFor{typeName}";
+    //                     moduleTypes.Add (createEnumType enumTypeName cases None)
+    //                     let arrayOfEnum = SynType.List(SynType.Create enumTypeName)
+    //                     moduleTypes.Add (createTypeAbbreviation typeName arrayOfEnum)
 
-                        visitedTypes.Add enumTypeName
-                        visitedTypes.Add typeName
-                    | _ ->
-                        // create abbreviated type
-                        let abbreviatedType =
-                            match topLevelObject.Value.Format with
-                            | "guid" | "uuid" -> SynType.Guid()
-                            | "date-time" -> SynType.DateTimeOffset()
-                            | "byte" -> SynType.ByteArray()
-                            | _ -> SynType.String()
+    //                     visitedTypes.Add enumTypeName
+    //                     visitedTypes.Add typeName
+    //                 | _ ->
+    //                     // create abbreviated type
+    //                     let abbreviatedType =
+    //                         match topLevelObject.Value.Format with
+    //                         | "guid" | "uuid" -> SynType.Guid()
+    //                         | "date-time" -> SynType.DateTimeOffset()
+    //                         | "byte" -> SynType.ByteArray()
+    //                         | _ -> SynType.String()
 
-                        let listOfAbbrev = SynType.List abbreviatedType
+    //                     let listOfAbbrev = SynType.List abbreviatedType
 
-                        moduleTypes.Add (createTypeAbbreviationWithDocs typeName listOfAbbrev topLevelObject.Value.Description)
-                        visitedTypes.Add typeName
-                elif elementType.Type = "integer" then
-                    match elementType with
-                    | IntEnum typeName cases ->
-                        // create global enum type
-                        let enumTypeName = $"EnumFor{typeName}";
-                        moduleTypes.Add(createFlagsEnum typeName cases)
-                        let arrayOfEnum = SynType.List(SynType.Create enumTypeName)
-                        moduleTypes.Add (createTypeAbbreviation typeName arrayOfEnum)
-                        visitedTypes.Add typeName
-                    | _ ->
-                        // create type abbreviation
-                        let abbreviatedType =
-                            match elementType.Format with
-                            | "int64" -> SynType.List(SynType.Int64())
-                            | _ -> SynType.List(SynType.Int())
-                        moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
-                        visitedTypes.Add typeName
-                elif elementType.Type = "number" then
-                    // create type abbreviation
-                    let abbreviatedType =
-                        match elementType.Format with
-                        | "float" -> SynType.List(SynType.Float32())
-                        | _ -> SynType.List(SynType.Double())
-                    moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
-                    visitedTypes.Add typeName
-                elif elementType.Type = "boolean" then
-                    // create type abbreviation
-                    moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Bool())))
-                    visitedTypes.Add typeName
-                elif elementType.Type = "object" && not (visitedTypes.Contains $"{typeName}ArrayItem") then
-                    let elementTypeName = $"{typeName}ArrayItem"
-                    visitedTypes.Add typeName
-                    visitedTypes.Add elementTypeName
-                    let factory = FactoryFunction.Create
-                    for createdType in createRecordFromSchema elementTypeName elementType visitedTypes config openApiDocument factory do
-                        moduleTypes.Add createdType
-                    let abbreviatedType = SynType.List(SynType.Create elementTypeName)
-                    moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
-            else
-                ()
+    //                     moduleTypes.Add (createTypeAbbreviationWithDocs typeName listOfAbbrev topLevelObject.Value.Description)
+    //                     visitedTypes.Add typeName
+    //             elif elementType.Type = "integer" then
+    //                 match elementType with
+    //                 | IntEnum typeName cases ->
+    //                     // create global enum type
+    //                     let enumTypeName = $"EnumFor{typeName}";
+    //                     moduleTypes.Add(createFlagsEnum typeName cases)
+    //                     let arrayOfEnum = SynType.List(SynType.Create enumTypeName)
+    //                     moduleTypes.Add (createTypeAbbreviation typeName arrayOfEnum)
+    //                     visitedTypes.Add typeName
+    //                 | _ ->
+    //                     // create type abbreviation
+    //                     let abbreviatedType =
+    //                         match elementType.Format with
+    //                         | "int64" -> SynType.List(SynType.Int64())
+    //                         | _ -> SynType.List(SynType.Int())
+    //                     moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
+    //                     visitedTypes.Add typeName
+    //             elif elementType.Type = "number" then
+    //                 // create type abbreviation
+    //                 let abbreviatedType =
+    //                     match elementType.Format with
+    //                     | "float" -> SynType.List(SynType.Float32())
+    //                     | _ -> SynType.List(SynType.Double())
+    //                 moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
+    //                 visitedTypes.Add typeName
+    //             elif elementType.Type = "boolean" then
+    //                 // create type abbreviation
+    //                 moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Bool())))
+    //                 visitedTypes.Add typeName
+    //             elif elementType.Type = "object" && not (visitedTypes.Contains $"{typeName}ArrayItem") then
+    //                 let elementTypeName = $"{typeName}ArrayItem"
+    //                 visitedTypes.Add typeName
+    //                 visitedTypes.Add elementTypeName
+    //                 let factory = FactoryFunction.Create
+    //                 for createdType in createRecordFromSchema elementTypeName elementType visitedTypes config openApiDocument factory do
+    //                     moduleTypes.Add createdType
+    //                 let abbreviatedType = SynType.List(SynType.Create elementTypeName)
+    //                 moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
+    //         else
+    //             ()
 
-        // then handle the global objects
-        for topLevelObject in openApiDocument.Components.Schemas do
-            let canUseTitle =
-                not (invalidTitle topLevelObject.Value.Title)
-                && not (isGlobalRef topLevelObject.Value.Title openApiDocument)
+    //     // then handle the global objects
+    //     for topLevelObject in openApiDocument.Components.Schemas do
+    //         let canUseTitle =
+    //             not (invalidTitle topLevelObject.Value.Title)
+    //             && not (isGlobalRef topLevelObject.Value.Title openApiDocument)
 
-            let typeName =
-                if canUseTitle
-                then sanitizeTypeName topLevelObject.Value.Title
-                else sanitizeTypeName topLevelObject.Key
+    //         let typeName =
+    //             if canUseTitle
+    //             then sanitizeTypeName topLevelObject.Value.Title
+    //             else sanitizeTypeName topLevelObject.Key
 
-            if config.odataSchema then  
-                topLevelObject.Value.Title <- topLevelObject.Key
+    //         if config.odataSchema then
+    //             topLevelObject.Value.Title <- topLevelObject.Key
 
-            let isAllOf =
-                isNull topLevelObject.Value.Type
-                && not (isNull topLevelObject.Value.AllOf)
-                && topLevelObject.Value.AllOf.Count > 0
+    //         let isAllOf =
+    //             isNull topLevelObject.Value.Type
+    //             && not (isNull topLevelObject.Value.AllOf)
+    //             && topLevelObject.Value.AllOf.Count > 0
 
-            let isKeyValuePairObject =
-                topLevelObject.Value.Type = "object"
-                && topLevelObject.Value.Title = "KeyValuePair`2"
-                && topLevelObject.Value.Properties.Count = 2
-                && topLevelObject.Value.Properties.ContainsKey "Key"
-                && topLevelObject.Value.Properties.ContainsKey "Value"
+    //         let isKeyValuePairObject =
+    //             topLevelObject.Value.Type = "object"
+    //             && topLevelObject.Value.Title = "KeyValuePair`2"
+    //             && topLevelObject.Value.Properties.Count = 2
+    //             && topLevelObject.Value.Properties.ContainsKey "Key"
+    //             && topLevelObject.Value.Properties.ContainsKey "Value"
 
-            if isEmptySchema topLevelObject.Value then
-                match config.emptyDefinitions with
-                | EmptyDefinitionResolution.Ignore -> ()
-                | EmptyDefinitionResolution.GenerateFreeForm ->
-                    let freeFormType =
-                        if config.target = Target.FSharp
-                        then SynType.JToken()
-                        else SynType.Object()
-                    moduleTypes.Add (createTypeAbbreviationWithDocs typeName freeFormType topLevelObject.Value.Description)
-                    visitedTypes.Add typeName
-            elif isPrimitiveAllOf topLevelObject.Value then
-                // handled in primitive types case
-                ()
-            elif isKeyValuePairObject && not (visitedTypes.Contains "KeyValuePair") then
-                // create specialized key value pair when encountering auto generated type
-                // from .NET backend services that encode System.Collections.Generic.KeyValuePair
-                moduleTypes.Add(createKeyValuePair())
-                visitedTypes.Add "KeyValuePair"
-            elif isKeyValuePairObject then
-                // skip generating more key value pair type
-                ()
-            elif topLevelObject.Value.Type = "object" || isAllOf || (isNull topLevelObject.Value.Type && topLevelObject.Value.Properties.Count > 0) then
-                if not (visitedTypes.Contains typeName) then
-                    visitedTypes.Add typeName
-                    let factory = FactoryFunction.Create
-                    for createdType in createRecordFromSchema typeName topLevelObject.Value visitedTypes config openApiDocument factory do
-                        moduleTypes.Add createdType
-            else
-                ()
+    //         if isEmptySchema topLevelObject.Value then
+    //             match config.emptyDefinitions with
+    //             | EmptyDefinitionResolution.Ignore -> ()
+    //             | EmptyDefinitionResolution.GenerateFreeForm ->
+    //                 let freeFormType =
+    //                     if config.target = Target.FSharp
+    //                     then SynType.JToken()
+    //                     else SynType.Object()
+    //                 moduleTypes.Add (createTypeAbbreviationWithDocs typeName freeFormType topLevelObject.Value.Description)
+    //                 visitedTypes.Add typeName
+    //         elif isPrimitiveAllOf topLevelObject.Value then
+    //             // handled in primitive types case
+    //             ()
+    //         elif isKeyValuePairObject && not (visitedTypes.Contains "KeyValuePair") then
+    //             // create specialized key value pair when encountering auto generated type
+    //             // from .NET backend services that encode System.Collections.Generic.KeyValuePair
+    //             moduleTypes.Add(createKeyValuePair())
+    //             visitedTypes.Add "KeyValuePair"
+    //         elif isKeyValuePairObject then
+    //             // skip generating more key value pair type
+    //             ()
+    //         elif topLevelObject.Value.Type = "object" || isAllOf || (isNull topLevelObject.Value.Type && topLevelObject.Value.Properties.Count > 0) then
+    //             if not (visitedTypes.Contains typeName) then
+    //                 visitedTypes.Add typeName
+    //                 let factory = FactoryFunction.Create
+    //                 for createdType in createRecordFromSchema typeName topLevelObject.Value visitedTypes config openApiDocument factory do
+    //                     moduleTypes.Add createdType
+    //         else
+    //             ()
 
     for path in openApiDocument.Paths do
         for operation in path.Value.Operations do
-            if includeOperation operation.Value config then 
+            if includeOperation operation.Value config then
                 let responseTypes = createResponseType operation.Value path.Key operation.Key visitedTypes config openApiDocument
                 moduleTypes.AddRange responseTypes
 
@@ -1892,6 +1946,7 @@ type OperationParameter = {
     location: string
     style: string
     properties: string list
+    defaultValue: Microsoft.OpenApi.Any.IOpenApiAny
 }
 
 let paramReplace (parameter: string) (sep: char) =
@@ -2026,6 +2081,11 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                             if parameter.Style.HasValue
                             then (string parameter.Style).ToLower()
                             else "none"
+                        defaultValue =
+                            if isNotNull parameter.Schema then
+                                if isNotNull parameter.Schema.Enum && parameter.Schema.Enum.Count = 1 then parameter.Schema.Enum.[0]
+                                else parameter.Schema.Default
+                            else null
                     }
 
     if not (isNull operation.RequestBody) then
@@ -2062,6 +2122,7 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                 location = "jsonContent"
                 style = "none"
                 properties = []
+                defaultValue = null
             }
 
         elif content.ContainsKey "application/json" && isEmptySchema content.["application/json"].Schema && config.emptyDefinitions = EmptyDefinitionResolution.GenerateFreeForm then
@@ -2090,6 +2151,7 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                 location = "jsonContent"
                 style = "none"
                 properties = []
+                defaultValue = null
             }
 
         elif content.ContainsKey "multipart/form-data" && isNotNull content.["multipart/form-data"].Schema && content.["multipart/form-data"].Schema.Type = "object" then
@@ -2111,8 +2173,9 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                     properties = []
                     location = "multipartFormData"
                     style = "formfield"
+                    defaultValue = null
                 }
-        
+
         elif content.ContainsKey "multipart/form-data" && isNotNull content.["multipart/form-data"].Schema && content.["multipart/form-data"].Schema.Type = "file" then
             let parameterName =
                 if operation.RequestBody.Extensions.ContainsKey "x-bodyName" then
@@ -2126,7 +2189,7 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                 parameterName = parameterName
                 parameterIdent = cleanParamIdent parameterName parameters
                 required = true
-                parameterType = 
+                parameterType =
                     if config.target = Target.FSharp
                     then SynType.ByteArray()
                     else SynType.Create "File" // from Browser.Types
@@ -2134,6 +2197,7 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                 properties = []
                 location = "multipartFormData"
                 style = "formfield"
+                defaultValue = null
             }
 
         elif content.ContainsKey "application/x-www-form-urlencoded" then
@@ -2149,6 +2213,7 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                         properties = []
                         location = "urlEncodedFormData"
                         style = "formfield"
+                        defaultValue = null
                     }
 
         elif content.ContainsKey "application/octet-stream" then
@@ -2161,6 +2226,7 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
                 location = "binaryContent"
                 style = "formfield"
                 properties = []
+                defaultValue = null
             }
         else
             ()
@@ -2168,10 +2234,13 @@ let operationParameters (operation: OpenApiOperation) (visitedTypes: ResizeArray
     parameters
     |> Seq.sortBy (fun param ->
         // required parameters come first
-        if param.required
-        then 0
+        if isNotNull param.defaultValue then
+            if param.required then 10
+            else 11
+        else if param.required then 0
         else 1
     )
+    |> Seq.toArray
 
 
 
@@ -2243,23 +2312,23 @@ let createOpenApiClient
     let urlContructorParam = SynSimplePat.CreateTyped(Ident.Create "url", SynType.String())
     let headersConstructorParam = SynSimplePat.CreateTyped(Ident.Create "headers", SynType.List(SynType.Create "Header"))
 
-    if config.target = Target.FSharp then 
+    if config.target = Target.FSharp then
         clientMembers.Add(SynMemberDefn.CreateImplicitCtor [ httpClient ])
-    else 
-        clientMembers.Add(SynMemberDefn.CreateImplicitCtor [ 
+    else
+        clientMembers.Add(SynMemberDefn.CreateImplicitCtor [
             urlContructorParam
             headersConstructorParam
         ])
 
         let emptyHeadersList = SynExpr.CreateList [ ]
-        let synValDataAsConstructor = 
-            match SynBindingRcd.Null.ValData with 
-            | SynValData(Some memberFlags, synValInfo, ident) -> 
+        let synValDataAsConstructor =
+            match SynBindingRcd.Null.ValData with
+            | SynValData(Some memberFlags, synValInfo, ident) ->
                 let modifiedFlags = { memberFlags with MemberKind = MemberKind.Constructor }
                 SynValData(Some modifiedFlags, synValInfo, ident)
-            | _ -> 
+            | _ ->
                 SynBindingRcd.Null.ValData
- 
+
         // generates new(url: string) = Client(url, [])
         // to initialize the client without extra headers
         let implicitConstructor = SynMemberDefn.CreateMember {
@@ -2385,7 +2454,7 @@ let createOpenApiClient
                         SynExpr.CreateIdent (Ident.Create "httpClient")
                         SynExpr.CreateConstString fullPath
                         SynExpr.Ident requestParts
-                    else 
+                    else
                         // apply the base path to the generated functions
                         SynExpr.CreateIdent (Ident.Create "url")
                         // the path the of the end point
@@ -2396,7 +2465,7 @@ let createOpenApiClient
                 ])
 
                 let wrappedReturn expr =
-                    match config.target with 
+                    match config.target with
                     | Target.FSharp when config.synchronous -> expr
                     | _ -> SynExpr.CreateReturn expr
 
@@ -2455,13 +2524,31 @@ let createOpenApiClient
                         if response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "string" && response.Content.["application/json"].Schema.Format = "byte" then
                             // Assume we have a binary response
                             SynExpr.CreatePartialApp([responseType; status], [
-                                createIdent [ contentIdent ]
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                createIdent [ contentIdent ]
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
+
                             ])
                             |> wrappedReturn
                         elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "file" then
                             // Assume we have a binary response
                             SynExpr.CreatePartialApp([responseType; status], [
                                 createIdent [ contentIdent ]
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                createIdent [ contentIdent ]
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
                         elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "string" then
@@ -2473,11 +2560,20 @@ let createOpenApiClient
                                 createLetAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        createIdent [ "content" ]
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        createIdent [ contentIdent ]
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
+
                                     ])
                                     |> wrappedReturn
                                 )
-                            elif hasBinaryResponse && config.target = Target.Fable then 
+                            elif hasBinaryResponse && (config.target = Target.Fable || config.target = Target.FableThoth) then
                                 let body = SynExpr.CreatePartialApp(["Utilities"; "readBytesAsText"], [
                                     createIdent [ "contentBinary" ]
                                 ])
@@ -2485,55 +2581,96 @@ let createOpenApiClient
                                 createLetBangAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        createIdent [ "content" ]
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        createIdent [ contentIdent ]
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
                             else
-                                if config.odataSchema then 
+                                if config.odataSchema then
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 else
                                     // when the media type is JSON but the return type is string
                                     // read the string as is without deserialization
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        createIdent [ "content" ]
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        createIdent [ contentIdent ]
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "integer" && config.odataSchema then 
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "integer" && config.odataSchema then
                             // OData Schema and integer response schema combo
                             SynExpr.CreatePartialApp([responseType; status], [
-                                SynExpr.CreateParen(
-                                    SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                        createIdent [ "content" ]
-                                    ])
-                                )
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                    createIdent [ "content" ]
+                                                ])
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
+
                             ])
                             |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "boolean" && config.odataSchema then 
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "boolean" && config.odataSchema then
                             // OData Schema and boolean response schema combo
                             SynExpr.CreatePartialApp([responseType; status], [
-                                SynExpr.CreateParen(
-                                    SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                        createIdent [ "content" ]
-                                    ])
-                                )
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                    createIdent [ "content" ]
+                                                ])
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "number" && config.odataSchema then 
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "number" && config.odataSchema then
                             // OData Schema and number response schema combo
                             SynExpr.CreatePartialApp([responseType; status], [
-                                SynExpr.CreateParen(
-                                    SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                        createIdent [ "content" ]
-                                    ])
-                                )
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                    createIdent [ "content" ]
+                                                ])
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
                         elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && not (isEmptySchema response.Content.["application/json"].Schema) then
@@ -2545,15 +2682,21 @@ let createOpenApiClient
                                 createLetAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
-                            elif hasBinaryResponse && config.target = Target.Fable then 
+                            elif hasBinaryResponse && (config.target = Target.Fable || config.target = Target.FableThoth) then
                                 let body = SynExpr.CreatePartialApp(["Utilities"; "readBytesAsText"], [
                                     createIdent [ "contentBinary" ]
                                 ])
@@ -2561,21 +2704,33 @@ let createOpenApiClient
                                 createLetBangAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
                             else
                                 SynExpr.CreatePartialApp([responseType; status], [
-                                    SynExpr.CreateParen(
-                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                            createIdent [ "content" ]
-                                        ])
-                                    )
+                                    if status = "DefaultResponse" then
+                                        SynExpr.CreateParen(
+                                                SynExpr.CreateTuple([
+                                                    SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                        createIdent [ "content" ]
+                                                    ])
+                                                    createIdent [ "status" ]
+                                                ])
+                                            )
+                                    else
+                                        createIdent [ contentIdent ]
                                 ])
                                 |> wrappedReturn
                         elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && isEmptySchema response.Content.["application/json"].Schema && isNotNull response.Content.["application/json"].Schema.AdditionalProperties then
@@ -2587,15 +2742,21 @@ let createOpenApiClient
                                 createLetAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
-                            elif hasBinaryResponse && config.target = Target.Fable then 
+                            elif hasBinaryResponse && (config.target = Target.Fable || config.target = Target.FableThoth) then
                                 let body = SynExpr.CreatePartialApp(["Utilities"; "readBytesAsText"], [
                                     createIdent [ "contentBinary" ]
                                 ])
@@ -2603,26 +2764,38 @@ let createOpenApiClient
                                 createLetBangAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
                             else
                                 SynExpr.CreatePartialApp([responseType; status], [
-                                    SynExpr.CreateParen(
-                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                            createIdent [ "content" ]
-                                        ])
-                                    )
+                                    if status = "DefaultResponse" then
+                                        SynExpr.CreateParen(
+                                                SynExpr.CreateTuple([
+                                                    SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                        createIdent [ "content" ]
+                                                    ])
+                                                    createIdent [ "status" ]
+                                                ])
+                                            )
+                                    else
+                                        createIdent [ contentIdent ]
                                 ])
                                 |> wrappedReturn
                         elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && isEmptySchema response.Content.["application/json"].Schema then
                             // reference to an empty schema
-                            if config.emptyDefinitions = EmptyDefinitionResolution.GenerateFreeForm then 
+                            if config.emptyDefinitions = EmptyDefinitionResolution.GenerateFreeForm then
                                 if hasBinaryResponse && config.target = Target.FSharp then
                                     let body = SynExpr.CreatePartialApp(["Encoding"; "UTF8"; "GetString"], [
                                         createIdent [ "contentBinary" ]
@@ -2631,15 +2804,21 @@ let createOpenApiClient
                                     createLetAssignment (Ident.Create "content") body (
                                         // continuation
                                         SynExpr.CreatePartialApp([responseType; status], [
-                                            SynExpr.CreateParen(
-                                                SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                    createIdent [ "content" ]
-                                                ])
-                                            )
+                                            if status = "DefaultResponse" then
+                                                SynExpr.CreateParen(
+                                                        SynExpr.CreateTuple([
+                                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                                createIdent [ "content" ]
+                                                            ])
+                                                            createIdent [ "status" ]
+                                                        ])
+                                                    )
+                                            else
+                                                createIdent [ contentIdent ]
                                         ])
                                         |> wrappedReturn
                                     )
-                                elif hasBinaryResponse && config.target = Target.Fable then 
+                                elif hasBinaryResponse && (config.target = Target.Fable || config.target = Target.FableThoth) then
                                     let body = SynExpr.CreatePartialApp(["Utilities"; "readBytesAsText"], [
                                         createIdent [ "contentBinary" ]
                                     ])
@@ -2647,31 +2826,60 @@ let createOpenApiClient
                                     createLetBangAssignment (Ident.Create "content") body (
                                         // continuation
                                         SynExpr.CreatePartialApp([responseType; status], [
-                                            SynExpr.CreateParen(
-                                                SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                    createIdent [ "content" ]
-                                                ])
-                                            )
+                                            if status = "DefaultResponse" then
+                                                SynExpr.CreateParen(
+                                                        SynExpr.CreateTuple([
+                                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                                createIdent [ "content" ]
+                                                            ])
+                                                            createIdent [ "status" ]
+                                                        ])
+                                                    )
+                                            else
+                                                createIdent [ contentIdent ]
                                         ])
                                         |> wrappedReturn
                                     )
                                 else
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
-                            else 
+                            else
                                 // ignore
-                                createIdent [ responseType; status ]
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                createIdent [ responseType; status ]
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ responseType; status ]
                                 |> wrappedReturn
 
-                        elif response.Content.ContainsKey "application/json" && isNull response.Content.["application/json"].Schema then 
-                            createIdent [ responseType; status ]
+                        elif response.Content.ContainsKey "application/json" && isNull response.Content.["application/json"].Schema then
+                            if status = "DefaultResponse" then
+                                SynExpr.CreateParen(
+                                        SynExpr.CreateTuple([
+                                            createIdent [ responseType; status ]
+                                            createIdent [ "status" ]
+                                        ])
+                                    )
+                            else
+                                createIdent [ responseType; status ]
                             |> wrappedReturn
+
                         elif response.Content.ContainsKey "*/*" && isNotNull (response.Content.["*/*"].Schema) && not (isEmptySchema response.Content.["*/*"].Schema) then
                             if hasBinaryResponse && config.target = Target.FSharp then
                                 let body = SynExpr.CreatePartialApp(["Encoding"; "UTF8"; "GetString"], [
@@ -2681,15 +2889,21 @@ let createOpenApiClient
                                 createLetAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
-                            elif hasBinaryResponse && config.target = Target.Fable then
+                            elif hasBinaryResponse && (config.target = Target.Fable || config.target = Target.FableThoth) then
                                 let body = SynExpr.CreatePartialApp(["Utilities"; "readBytesAsText"], [
                                     createIdent [ "contentBinary" ]
                                 ])
@@ -2697,24 +2911,38 @@ let createOpenApiClient
                                 createLetBangAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        SynExpr.CreateParen(
-                                            SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                                createIdent [ "content" ]
-                                            ])
-                                        )
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                            createIdent [ "content" ]
+                                                        ])
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
                             else
                                 SynExpr.CreatePartialApp([responseType; status], [
-                                    SynExpr.CreateParen(
-                                        SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
-                                            createIdent [ "content" ]
-                                        ])
-                                    )
+                                    if status = "DefaultResponse" then
+                                        SynExpr.CreateParen(
+                                                SynExpr.CreateTuple([
+                                                    SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
+                                                        createIdent [ "content" ]
+                                                    ])
+                                                    createIdent [ "status" ]
+                                                ])
+                                            )
+                                    else
+                                        createIdent [ contentIdent ]
                                 ])
                                 |> wrappedReturn
-                        elif response.Content.ContainsKey "text/plain" && isNotNull response.Content.["text/plain"].Schema then
+                        elif response.Content.ContainsKey "text/plain"
+                            //&& isNotNull response.Content.["text/plain"].Schema
+                            then
                             if hasBinaryResponse && config.target = Target.FSharp then
                                 let body = SynExpr.CreatePartialApp(["Encoding"; "UTF8"; "GetString"], [
                                     createIdent [ "contentBinary" ]
@@ -2723,11 +2951,19 @@ let createOpenApiClient
                                 createLetAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        createIdent [ "content" ]
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        createIdent [ contentIdent ]
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
-                            elif hasBinaryResponse && config.target = Target.Fable then
+                            elif hasBinaryResponse && (config.target = Target.Fable || config.target = Target.FableThoth) then
                                 let body = SynExpr.CreatePartialApp(["Utilities"; "readBytesAsText"], [
                                     createIdent [ "contentBinary" ]
                                 ])
@@ -2735,37 +2971,85 @@ let createOpenApiClient
                                 createLetBangAssignment (Ident.Create "content") body (
                                     // continuation
                                     SynExpr.CreatePartialApp([responseType; status], [
-                                        createIdent [ "content" ]
+                                        if status = "DefaultResponse" then
+                                            SynExpr.CreateParen(
+                                                    SynExpr.CreateTuple([
+                                                        createIdent [ contentIdent ]
+                                                        createIdent [ "status" ]
+                                                    ])
+                                                )
+                                        else
+                                            createIdent [ contentIdent ]
                                     ])
                                     |> wrappedReturn
                                 )
                             else
                                 SynExpr.CreatePartialApp([responseType; status], [
-                                    createIdent [ "content" ]
+                                    if status = "DefaultResponse" then
+                                        SynExpr.CreateParen(
+                                                SynExpr.CreateTuple([
+                                                    createIdent [ contentIdent ]
+                                                    createIdent [ "status" ]
+                                                ])
+                                            )
+                                    else
+                                        createIdent [ contentIdent ]
                                 ])
                                 |> wrappedReturn
                         elif response.Content.ContainsKey "application/octet-stream" || response.Content.ContainsKey "application/pdf" || response.Content.ContainsKey "application/zip" then
                             SynExpr.CreatePartialApp([responseType; status], [
-                                createIdent [ contentIdent ]
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                createIdent [ contentIdent ]
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
                         elif response.Content.ContainsKey "image/png" && isNotNull response.Content.["image/png"].Schema && response.Content.["image/png"].Schema.Format = "binary" then
                             SynExpr.CreatePartialApp([responseType; status], [
-                                createIdent [ contentIdent ]
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                createIdent [ contentIdent ]
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
                         elif response.Content.ContainsKey "image/png" then
                             SynExpr.CreatePartialApp([responseType; status], [
-                                createIdent [ contentIdent ]
+                                if status = "DefaultResponse" then
+                                    SynExpr.CreateParen(
+                                            SynExpr.CreateTuple([
+                                                createIdent [ contentIdent ]
+                                                createIdent [ "status" ]
+                                            ])
+                                        )
+                                else
+                                    createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
                         else
-                            createIdent [ responseType; status ]
+                            if status = "DefaultResponse" then
+                                SynExpr.CreateParen(
+                                        SynExpr.CreateTuple([
+                                            createIdent [ responseType; status ]
+                                            createIdent [ "status" ]
+                                        ])
+                                    )
+                            else
+                                createIdent [ responseType; status ]
                             |> wrappedReturn
 
                     let statusIsEqual status =
-                        let statusCode = 
-                            match status with 
+                        let statusCode =
+                            match status with
                             | nameof HttpStatusCode.OK -> 200
                             | nameof HttpStatusCode.Created -> 201
                             | nameof HttpStatusCode.Accepted -> 202
@@ -2784,102 +3068,112 @@ let createOpenApiClient
                             | nameof HttpStatusCode.PaymentRequired -> 402
                             | _ -> 0
 
-                        if config.target = Target.FSharp then 
+                        if config.target = Target.FSharp then
                             equal (createIdent [ "status" ]) (createIdent [ "HttpStatusCode"; status ])
-                        else 
+                        else
                             equal (createIdent [ "status" ]) (SynExpr.CreateConst(SynConst.Int32 statusCode))
 
-                    if responses.Length = 1 then
-                        createOutput responses.[0]
-                    elif responses.Length = 2 then
-                        let (status1, response1) = responses.[0]
-                        let (status2, response2) = responses.[1]
-                        SynExpr.CreateIfThenElse(statusIsEqual status1, createOutput responses.[0], createOutput responses.[1])
-                    elif responses.Length = 3 then
-                        let (status1, response1) = responses.[0]
-                        let (status2, response2) = responses.[1]
-                        let (status3, response3) = responses.[2]
-                        SynExpr.CreateIfThenElse(
-                            statusIsEqual status1,
-                            createOutput responses.[0],
+                    let rec buildResponses idx =
+                        if idx = responses.Length - 1 then createOutput responses.[idx]
+                        else
+                            let (status1, response1) = responses.[idx]
                             SynExpr.CreateIfThenElse(
-                                statusIsEqual status2,
-                                createOutput responses.[1],
-                                createOutput responses.[2]
-                            )
-                        )
-                    elif responses.Length = 4 then
-                        let (status1, response1) = responses.[0]
-                        let (status2, response2) = responses.[1]
-                        let (status3, response3) = responses.[2]
-                        let (status4, response4) = responses.[3]
-                        SynExpr.CreateIfThenElse(
-                            statusIsEqual status1,
-                            createOutput responses.[0],
-                            SynExpr.CreateIfThenElse(
-                                statusIsEqual status2,
-                                createOutput responses.[1],
-                                SynExpr.CreateIfThenElse(
-                                    statusIsEqual status3,
-                                    createOutput responses.[2],
-                                    createOutput responses.[3]
-                                )
-                            )
-                        )
-                    elif responses.Length = 5 then
-                        let (status1, response1) = responses.[0]
-                        let (status2, response2) = responses.[1]
-                        let (status3, response3) = responses.[2]
-                        let (status4, response4) = responses.[3]
-                        let (status5, response5) = responses.[4]
-                        SynExpr.CreateIfThenElse(
-                            statusIsEqual status1,
-                            createOutput responses.[0],
-                            SynExpr.CreateIfThenElse(
-                                statusIsEqual status2,
-                                createOutput responses.[1],
-                                SynExpr.CreateIfThenElse(
-                                    statusIsEqual status3,
-                                    createOutput responses.[2],
-                                    SynExpr.CreateIfThenElse(
-                                        statusIsEqual status4,
-                                        createOutput responses.[3],
-                                        createOutput responses.[4]
-                                    )
-                                )
-                            )
-                        )
-                    else
-                        let (status1, response1) = responses.[0]
-                        let (status2, response2) = responses.[1]
-                        let (status3, response3) = responses.[2]
-                        let (status4, response4) = responses.[3]
-                        let (status5, response5) = responses.[4]
-                        let (status6, response6) = responses.[5]
-                        SynExpr.CreateIfThenElse(
-                            statusIsEqual status1,
-                            createOutput responses.[0],
-                            SynExpr.CreateIfThenElse(
-                                statusIsEqual status2,
-                                createOutput responses.[1],
-                                SynExpr.CreateIfThenElse(
-                                    statusIsEqual status3,
-                                    createOutput responses.[2],
-                                    SynExpr.CreateIfThenElse(
-                                        statusIsEqual status4,
-                                        createOutput responses.[3],
-                                        SynExpr.CreateIfThenElse(
-                                            statusIsEqual status5,
-                                            createOutput responses.[4],
-                                            createOutput responses.[5]
-                                        )
-                                    )
-                                )
-                            )
-                        )
+                                statusIsEqual status1,
+                                createOutput (status1, response1),
+                                (buildResponses (idx + 1)))
+                    buildResponses 0
+
+                    // if responses.Length = 1 then
+                    //     createOutput responses.[0]
+                    // elif responses.Length = 2 then
+                    //     let (status1, response1) = responses.[0]
+                    //     let (status2, response2) = responses.[1]
+                    //     SynExpr.CreateIfThenElse(statusIsEqual status1, createOutput responses.[0], createOutput responses.[1])
+                    // elif responses.Length = 3 then
+                    //     let (status1, response1) = responses.[0]
+                    //     let (status2, response2) = responses.[1]
+                    //     let (status3, response3) = responses.[2]
+                    //     SynExpr.CreateIfThenElse(
+                    //         statusIsEqual status1,
+                    //         createOutput responses.[0],
+                    //         SynExpr.CreateIfThenElse(
+                    //             statusIsEqual status2,
+                    //             createOutput responses.[1],
+                    //             createOutput responses.[2]
+                    //         )
+                    //     )
+                    // elif responses.Length = 4 then
+                    //     let (status1, response1) = responses.[0]
+                    //     let (status2, response2) = responses.[1]
+                    //     let (status3, response3) = responses.[2]
+                    //     let (status4, response4) = responses.[3]
+                    //     SynExpr.CreateIfThenElse(
+                    //         statusIsEqual status1,
+                    //         createOutput responses.[0],
+                    //         SynExpr.CreateIfThenElse(
+                    //             statusIsEqual status2,
+                    //             createOutput responses.[1],
+                    //             SynExpr.CreateIfThenElse(
+                    //                 statusIsEqual status3,
+                    //                 createOutput responses.[2],
+                    //                 createOutput responses.[3]
+                    //             )
+                    //         )
+                    //     )
+                    // elif responses.Length = 5 then
+                    //     let (status1, response1) = responses.[0]
+                    //     let (status2, response2) = responses.[1]
+                    //     let (status3, response3) = responses.[2]
+                    //     let (status4, response4) = responses.[3]
+                    //     let (status5, response5) = responses.[4]
+                    //     SynExpr.CreateIfThenElse(
+                    //         statusIsEqual status1,
+                    //         createOutput responses.[0],
+                    //         SynExpr.CreateIfThenElse(
+                    //             statusIsEqual status2,
+                    //             createOutput responses.[1],
+                    //             SynExpr.CreateIfThenElse(
+                    //                 statusIsEqual status3,
+                    //                 createOutput responses.[2],
+                    //                 SynExpr.CreateIfThenElse(
+                    //                     statusIsEqual status4,
+                    //                     createOutput responses.[3],
+                    //                     createOutput responses.[4]
+                    //                 )
+                    //             )
+                    //         )
+                    //     )
+                    // else
+                    //     let (status1, response1) = responses.[0]
+                    //     let (status2, response2) = responses.[1]
+                    //     let (status3, response3) = responses.[2]
+                    //     let (status4, response4) = responses.[3]
+                    //     let (status5, response5) = responses.[4]
+                    //     let (status6, response6) = responses.[5]
+                    //     SynExpr.CreateIfThenElse(
+                    //         statusIsEqual status1,
+                    //         createOutput responses.[0],
+                    //         SynExpr.CreateIfThenElse(
+                    //             statusIsEqual status2,
+                    //             createOutput responses.[1],
+                    //             SynExpr.CreateIfThenElse(
+                    //                 statusIsEqual status3,
+                    //                 createOutput responses.[2],
+                    //                 SynExpr.CreateIfThenElse(
+                    //                     statusIsEqual status4,
+                    //                     createOutput responses.[3],
+                    //                     SynExpr.CreateIfThenElse(
+                    //                         statusIsEqual status5,
+                    //                         createOutput responses.[4],
+                    //                         createOutput responses.[5]
+                    //                     )
+                    //                 )
+                    //             )
+                    //         )
+                    //     )
 
                 let asyncBuilder expr =
-                    if config.target = Target.Fable then 
+                    if (config.target = Target.Fable || config.target = Target.FableThoth) then
                         SynExpr.CreateAsync expr
                     else
                         if config.synchronous then
@@ -2890,19 +3184,81 @@ let createOpenApiClient
                             | AsyncReturnType.Task -> SynExpr.CreateTask expr
 
                 let destructExpr httpFunc =
-                    match config.target with 
+                    match config.target with
                     | Target.FSharp when config.synchronous -> deconstructResponse (httpCall httpFunc) returnExpr
                     | _ -> deconstructAsyncResponse (httpCall httpFunc) returnExpr
 
-                let clientOperation httpFunc name = SynMemberDefn.CreateMember {
-                    SynBindingRcd.Null with
+
+
+                let clientOperation httpFunc name =
+                    let apiCall =
+                        createLetAssignment
+                            requestParts
+                            (SynExpr.CreateList requestValues)
+                            (destructExpr httpFunc)
+                    let parametersWithDefault = parameters |> Array.filter (fun p -> isNotNull p.defaultValue)
+                    let rec assignDefaultValues idx =
+                        if idx >= parametersWithDefault.Length then apiCall
+                        else
+                            let p = parametersWithDefault.[idx]
+                            let defaultValue = SynExpr.Const(
+
+// OpenApiArray.cs
+// OpenApiBinary.cs
+// OpenApiBoolean.cs
+// OpenApiByte.cs
+// OpenApiDate.cs
+// OpenApiDateTime.cs
+// OpenApiDouble.cs
+// OpenApiFloat.cs
+// OpenApiInteger.cs
+// OpenApiLong.cs
+// OpenApiNull.cs
+// OpenApiObject.cs
+// OpenApiPassword.cs
+// OpenApiString.cs
+
+                                                match p.defaultValue with
+                                                | :? Microsoft.OpenApi.Any.OpenApiString as primitiveValue -> SynConst.CreateString primitiveValue.Value
+                                                | :? Microsoft.OpenApi.Any.OpenApiBoolean as primitiveValue -> SynConst.Bool primitiveValue.Value
+                                                | :? Microsoft.OpenApi.Any.OpenApiDouble as primitiveValue -> SynConst.Double primitiveValue.Value
+                                                | :? Microsoft.OpenApi.Any.OpenApiFloat as primitiveValue -> SynConst.Single primitiveValue.Value
+                                                | :? Microsoft.OpenApi.Any.OpenApiInteger as primitiveValue -> SynConst.Int32 primitiveValue.Value
+                                                | :? Microsoft.OpenApi.Any.OpenApiLong as primitiveValue -> SynConst.Int64 primitiveValue.Value
+                                                | _ -> failwithf "unsupportged default parameter type %A" p.defaultValue
+
+
+                                                ,
+                                                range0)
+                            createLetAssignment
+                                (Ident.Create p.parameterIdent)
+                                (SynExpr.App(
+                                    ExprAtomicFlag.NonAtomic,
+                                    true,
+                                    (createIdent ["defaultArg"]),
+                                    (
+                                        SynExpr.App(
+                                            ExprAtomicFlag.NonAtomic,
+                                            true,
+                                            (createIdent [p.parameterIdent]),
+                                            ( defaultValue),
+                                            range0)
+                                    ),
+                                    range0))
+                                (assignDefaultValues (idx + 1))
+
+
+
+                    SynMemberDefn.CreateMember {
+                      SynBindingRcd.Null with
                         XmlDoc = xmlDocsWithParams summary parameterDocs
                         Expr =
                             asyncBuilder (
-                                createLetAssignment
-                                    requestParts
-                                    (SynExpr.CreateList requestValues)
-                                    (destructExpr httpFunc)
+                                (assignDefaultValues 0)
+                                // createLetAssignment
+                                //     requestParts
+                                //     (SynExpr.CreateList requestValues)
+                                //     (destructExpr httpFunc)
                             )
 
                         Pattern =
@@ -2915,7 +3271,7 @@ let createOpenApiClient
                                                     Range = range0
                                                     Type = parameter.parameterType
                                                     Pattern =
-                                                        if parameter.required
+                                                        if isNull parameter.defaultValue //parameter.required
                                                         then SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString(parameter.parameterIdent), [])
                                                         else SynPatRcd.OptionalVal {
                                                             Range = range0
@@ -2929,16 +3285,16 @@ let createOpenApiClient
                             ])
                 }
 
-                match config.target with 
-                | Target.FSharp when config.synchronous -> 
+                match config.target with
+                | Target.FSharp when config.synchronous ->
                     clientMembers.Add (clientOperation httpFunction memberName)
-                | _ -> 
+                | _ ->
                     clientMembers.Add (clientOperation httpFunctionAsync memberName)
 
     let clientType = SynModuleDecl.CreateType(info, Seq.toList clientMembers)
 
     let moduleContents = [
-        if config.target = Target.FSharp then 
+        if config.target = Target.FSharp then
             yield SynModuleDecl.CreateOpen "System.Net"
             yield SynModuleDecl.CreateOpen "System.Net.Http"
             yield SynModuleDecl.CreateOpen "System.Text"
@@ -3109,7 +3465,7 @@ let runConfig filePath =
 
             elif config.schema.StartsWith "http" && config.schema.EndsWith ".json" then
                 getSchema config.schema config.overrideSchema
-            elif config.schema.StartsWith "http" && config.schema.EndsWith ".yaml" then 
+            elif config.schema.StartsWith "http" && config.schema.EndsWith ".yaml" then
                 let schemaContent =
                     config.schema
                     |> client.GetStringAsync
@@ -3117,9 +3473,9 @@ let runConfig filePath =
                     |> Async.RunSynchronously
                 let schemaBytes = Encoding.UTF8.GetBytes(schemaContent)
                 new MemoryStream(schemaBytes) :> Stream
-            elif config.schema.StartsWith "http" then 
+            elif config.schema.StartsWith "http" then
                 getSchema config.schema config.overrideSchema
-            else 
+            else
                 getSchema (resolveFile config.schema) config.overrideSchema
         let settings = OpenApiReaderSettings()
         settings.ReferenceResolution <- ReferenceResolutionSetting.ResolveAllReferences
@@ -3160,14 +3516,15 @@ let runConfig filePath =
                         if config.asyncReturnType = AsyncReturnType.Task
                         then XElement.PackageReference("Ply", "0.3.1")
                     else
-                        XElement.PackageReference("Fable.SimpleJson", "3.21.0")
+                        // XElement.PackageReference("Fable.SimpleJson", "3.21.0")
                         XElement.PackageReference("Fable.SimpleHttp", "3.0.0")
+                        XElement.PackageReference("Thoth.Json", "6.0.0")
                 ]
 
                 let files = [
                     if config.target = Target.FSharp then
                         XElement.Compile "StringEnum.fs"
-                    
+
                     XElement.Compile "OpenApiHttp.fs"
                     XElement.Compile "Types.fs"
                     XElement.Compile "Client.fs"
@@ -3190,7 +3547,7 @@ let runConfig filePath =
             printfn "Succesfully generated project %s" (path [outputDir; $"{config.project}.fsproj" ])
             0
 
-let showTags filePath = 
+let showTags filePath =
     let config = resolveFile filePath
     match readConfig config with
     | Error errorMsg ->
@@ -3211,7 +3568,7 @@ let showTags filePath =
 
             elif config.schema.StartsWith "http" && config.schema.EndsWith ".json" then
                 getSchema config.schema config.overrideSchema
-            elif config.schema.StartsWith "http" && config.schema.EndsWith ".yaml" then 
+            elif config.schema.StartsWith "http" && config.schema.EndsWith ".yaml" then
                 let schemaContent =
                     config.schema
                     |> client.GetStringAsync
@@ -3219,9 +3576,9 @@ let showTags filePath =
                     |> Async.RunSynchronously
                 let schemaBytes = Encoding.UTF8.GetBytes(schemaContent)
                 new MemoryStream(schemaBytes) :> Stream
-            elif config.schema.StartsWith "http" then 
+            elif config.schema.StartsWith "http" then
                 getSchema config.schema config.overrideSchema
-            else 
+            else
                 getSchema (resolveFile config.schema) config.overrideSchema
         let settings = OpenApiReaderSettings()
         settings.ReferenceResolution <- ReferenceResolutionSetting.ResolveAllReferences
@@ -3244,13 +3601,13 @@ let showTags filePath =
             1
         else
             let tags = [
-                for path in openApiDocument.Paths do 
-                for operation in path.Value.Operations do 
-                if isNotNull operation.Value.OperationId then 
+                for path in openApiDocument.Paths do
+                for operation in path.Value.Operations do
+                if isNotNull operation.Value.OperationId then
                     for tag in operation.Value.Tags do tag.Name, operation.Value.OperationId
             ]
 
-            let content = 
+            let content =
                 tags
                 |> List.groupBy fst
                 |> List.sortByDescending (fun (tag, operations) -> operations.Length)
@@ -3279,36 +3636,36 @@ let main argv =
         runConfig file
     | [|"--config"; file; "--no-logo" |] ->
         runConfig file
-    | [| "--from-odata-schema"; schema; "--output"; output |] -> 
+    | [| "--from-odata-schema"; schema; "--output"; output |] ->
         printfn "Generating OpenAPI specs from OData schema at %s" schema
-        if schema.StartsWith "http" then 
-            let schemaWithMetadata = 
-                if schema.EndsWith "$metadata" 
-                then schema 
+        if schema.StartsWith "http" then
+            let schemaWithMetadata =
+                if schema.EndsWith "$metadata"
+                then schema
                 else $"{schema.TrimEnd '/'}/$metadata"
             let openApiSchema = readExternalODataSchema schemaWithMetadata
             let simplified = simplifyRedundantSchemaParts (JObject.Parse openApiSchema)
             File.WriteAllText(resolveFile output, simplified.ToString(Formatting.Indented))
             printfn "Generated OpenAPI specs saved as %s" (resolveFile output)
             0
-        elif schema.EndsWith ".xml" && File.Exists (resolveFile schema) then 
+        elif schema.EndsWith ".xml" && File.Exists (resolveFile schema) then
             let openApiSchema = readLocalODataSchema schema
             let simplified = simplifyRedundantSchemaParts (JObject.Parse openApiSchema)
             File.WriteAllText(resolveFile output, simplified.ToString(Formatting.Indented))
             printfn "Generated OpenAPI specs saved as %s" (resolveFile output)
             0
-        else 
+        else
             printfn "Invalid OData schema"
             printfn "Schema %s" schema
             1
 
-    | [| "--show-tags"; "--config"; filePath |] -> 
+    | [| "--show-tags"; "--config"; filePath |] ->
         printfn "Extracting OpenAPI tags schema at %s" filePath
         showTags filePath
-    | [| "--config"; filePath; "--show-tags" |] -> 
+    | [| "--config"; filePath; "--show-tags" |] ->
         printfn "Extracting OpenAPI tags schema at %s" filePath
         showTags filePath
-    | [| "--show-tags" |] -> 
+    | [| "--show-tags" |] ->
         showTags "./hawaii.json"
     | arguments ->
         printfn "Unknown arguments [%s]" (String.concat ", " arguments)
